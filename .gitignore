@@ -7,3 +7,5 @@ logs/
 .env
 .venv
 coverage
+model_converted/
+
