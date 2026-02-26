@@ -9,7 +9,8 @@ from typing import List, Optional
 from contextlib import asynccontextmanager
 
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -145,6 +146,16 @@ async def lifespan(app: FastAPI):
 # --- APP ---
 app = FastAPI(title="Qwen2.5 High-Performance API", lifespan=lifespan)
 
+# --- Configuración CORS ---
+# Permite que main.html haga peticiones a este servidor local sin errores de CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Para desarrollo. En producción, especificar los dominios permitidos.
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # --- MODELOS ---
 class Message(BaseModel):
     role: str
@@ -155,35 +166,47 @@ class ChatRequest(BaseModel):
     max_tokens: int = 2048
     temperature: float = 0.7
 
-# --- ENDPOINT OPTIMIZADO CON STREAMING ---
-@app.post("/chat")
-async def chat_stream(request: ChatRequest):
+# --- ENDPOINT OPTIMIZADO CON WEBSOCKETS ---
+@app.websocket("/ws/chat")
+async def websocket_endpoint(websocket: WebSocket):
     """
-    Endpoint de Chat con Streaming. 
-    Responde instantáneamente token por token.
+    Endpoint de Chat por WebSocket.
+    Evita cualquier buffering HTTP del navegador y entrega los tokens en puro tiempo real.
     """
+    await websocket.accept()
     try:
-        messages_dict = [{"role": m.role, "content": m.content} for m in request.messages]
+        data = await websocket.receive_json()
+        messages = data.get("messages", [])
+        max_tokens = data.get("max_tokens", 2048)
+        temperature = data.get("temperature", 0.7)
+
+        messages_dict = [{"role": m.get("role", "user"), "content": m.get("content", "")} for m in messages]
         
-        # Función generadora interna para el StreamingResponse
-        async def response_generator():
-            # Iteramos sobre el generador síncrono del modelo
-            # Usamos asyncio.to_thread si quisiéramos envolver todo, 
-            # pero como ya usamos threading y queue internamente, podemos iterar directo con pequeños sleeps si fuera necesario,
-            # pero yield directo funciona bien en FastAPI.
-            for token in qwen_model.stream_response(
-                messages_dict, 
-                max_tokens=request.max_tokens, 
-                temperature=request.temperature
-            ):
-                # Formato de evento simple o texto crudo. 
-                # Para máxima simplicidad devolvemos texto crudo.
-                yield token
+        for token in qwen_model.stream_response(
+            messages_dict, 
+            max_tokens=max_tokens, 
+            temperature=temperature
+        ):
+            await websocket.send_text(token)
+            # Un micro sleep asegura que FastAPI envíe el frame por red inmediatamente
+            await asyncio.sleep(0.001) 
 
-        return StreamingResponse(response_generator(), media_type="text/plain")
-
+        # Enviar señal de que terminó (opcional, cerraremos la conexión desde el server o enviamos token especial)
+        await websocket.send_text("[DONE]")
+            
+    except WebSocketDisconnect:
+        logger.info("Cliente desconectado del WebSocket.")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error WebSocket: {e}")
+        try:
+            await websocket.send_text(f"[ERROR: {str(e)}]")
+        except:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except:
+            pass
 
 if __name__ == "__main__":
     # Ajustes de Uvicorn para producción
